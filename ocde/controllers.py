@@ -1,127 +1,166 @@
-from entities import *
-from repositories import *
-from command import PersonalizationCommand
-from inf import DeviceManager
 import time
-import pyttsx3
-import speech_recognition as sr
+import re
+from typing import List
+# Note: pyttsx3 mock for environments without audio drivers
+try:
+    import pyttsx3
+except ImportError:
+    pyttsx3 = None
 
-class Subject:
-    def __init__(self):
-        self._observers = []
-    def attach(self, observer):
-        if observer not in self._observers: self._observers.append(observer)
-    def notify(self, message):
-        for observer in self._observers:
-            for obs in self._observers: obs.update(message)
+from entities import *
 
+# --- Direction 1: Noise Canceling (Source 19) ---
 class RequestController:
-    def __init__(self, sound_repo: SoundRepository, req_repo: RequestRepository):
-        self.sound_repo = sound_repo
-        self.req_repo = req_repo
-        self.recognizer = sr.Recognizer()
+    def __init__(self, noise_algo: IAdaptiveAlgorithm, repo: IRepository, view: IView):
+        self.algorithm = noise_algo
+        self.repo = repo
+        self.view = view
 
-    def capture_audio(self) -> SoundData:
-        print("\nскажите запрос")
-        with sr.Microphone() as source:
-            self.recognizer.adjust_for_ambient_noise(source)
-            audio = self.recognizer.listen(source, timeout=5)
+    def capture_and_process(self, raw_audio: bytes, env_type: str, user: User) -> Request:
+        self.view.display(f"Получен аудиосигнал из среды: {env_type}")
         
-        sound_data = SoundData(id=int(time.time()), audio_source=audio, noise_level="Low")
-        self.sound_repo.save(sound_data)
-        return sound_data
+        # Адаптивное применение алгоритма (Source 53)
+        if env_type in ["factory", "construction", "noisy"]:
+            processed_audio = self.algorithm.apply_algorithm(raw_audio)
+        else:
+            processed_audio = raw_audio
+            print("   [Request] Шумоподавление не требуется")
 
-    def create_request_from_audio(self, user: User, sound: SoundData) -> Request:
-        try:
-            text = self.recognizer.recognize_google(sound.audio_source, language="ru-RU")
-            req = Request(id=str(time.time()), raw_text=text, language="ru", accuracy=90, user_id=user.id)
-            self.req_repo.save(req)
-            return req
-        except sr.UnknownValueError:
-            return Request(id="err", raw_text="", language="ru", accuracy=0, user_id=user.id)
+        # Mock распознавания речи (т.к. нет реального микрофона)
+        # Здесь мы симулируем перевод аудио в текст
+        recognized_text = "система приготовь мне зеленый чай" # Default simulation
+        
+        req = Request(
+            id=str(time.time()),
+            raw_text=recognized_text, # В реальной системе здесь результат STT
+            language="ru",
+            accuracy=95,
+            user_id=user.id
+        )
+        self.repo.save(req)
+        return req
+    
+    # Метод для симуляции текстового ввода (для тестов)
+    def process_text_input(self, text: str, user: User) -> Request:
+         return Request(id=str(time.time()), raw_text=text, language="ru", accuracy=100, user_id=user.id)
+
+# --- Analysis Logic (Source 13) ---
+class MLAnalysisStrategy(IAnalysisStrategy):
+    def analyze(self, text: str) -> AnalysisResult:
+        text = text.lower()
+        confidence = 0.9
+        
+        # Сценарий 1: Температура (Source 66)
+        if "температур" in text or "градус" in text:
+            intent = "control_climate"
+            temp = int(re.search(r'\d+', text).group()) if re.search(r'\d+', text) else 22
+            return AnalysisResult(intent, confidence, {"target_temp": temp})
+            
+        # Сценарий 2: Чай (Source 70)
+        elif "чай" in text:
+            intent = "order_drink"
+            tea_type = "зеленый" if "зелен" in text else "черный"
+            return AnalysisResult(intent, confidence, {"item": "tea", "type": tea_type})
+        
+        # Direction 2: Interrupts (Source 54)
+        elif text in ["стоп", "пауза", "отмена", "stop"]:
+            return AnalysisResult("emergency_stop", 1.0, {})
+
+        return AnalysisResult("unknown", 0.0, {})
 
 class AnalysisController:
-    def __init__(self, req_repo, strategy):
-        self.req_repo = req_repo
+    def __init__(self, strategy: IAnalysisStrategy):
         self.strategy = strategy
+        
+    def analyze(self, request: Request) -> AnalysisResult:
+        return self.strategy.analyze(request.raw_text)
 
-    def analyze_request(self, request: Request) -> dict:
-        result = self.strategy.analyze(request.raw_text)
-        return {
-            "intent": result.intent,
-            "confidence": result.confidence,
-            "params": result.entities
-        }
-
-class OperationController(Subject):
-    def __init__(self, repo, view):
-        super().__init__()
+# --- Direction 2: Operations & Interrupts (Source 21) ---
+class OperationController:
+    def __init__(self, repo: IRepository, view: IView):
         self.repo = repo
-        self.attach(view)
+        self.view = view
 
-    def execute_critical_check(self, intent: str) -> bool:
-        if intent in ["stop", "emergency_stop", "пауза"]:
-            self.notify("крит. ошибка")
+    def check_critical_and_log(self, analysis: AnalysisResult) -> bool:
+        # Логирование операции
+        op_entry = OperationLogEntry(
+            record_id=str(time.time()),
+            record=f"Intent: {analysis.intent}",
+            status="Running"
+        )
+        self.repo.save(op_entry)
+
+        # Обработка прерываний (Source 54)
+        if analysis.intent == "emergency_stop":
+            self.view.update("!!! ЭКСТРЕННАЯ ОСТАНОВКА !!!")
+            self._stop_all_devices()
+            op_entry.status = "Stopped"
             return True
+            
         return False
 
+    def _stop_all_devices(self):
+        print("   [Operation] Отправка сигнала STOP всем контроллерам устройств...")
+
+# --- Decision & Execution (BPMN Logic) ---
 class DecisionController:
-    def __init__(self, decision_repo: DecisionRepository, device_manager: DeviceManager):
-        self.decision_repo = decision_repo
-        self.devices = device_manager
+    def __init__(self, repo: IRepository, dev_mgr):
+        self.repo = repo
+        self.devices = dev_mgr
 
-    def make_decision(self, analysis_data: dict) -> Decision:
-        intent = analysis_data.get("intent")
-        params = analysis_data.get("params", {})
+    def make_decision(self, analysis: AnalysisResult) -> Decision:
+        decision = Decision("err", "none", "none", {}, "Не поняла команду")
         
-        # Реализация логики BPMN (Image 10 из ЛР 2)
-        if intent == "order_drink":
+        if analysis.intent == "control_climate":
+            ac = self.devices.get_device("ac")
+            temp = analysis.entities.get("target_temp")
+            ac.execute_command("set_temp", {"temp": temp})
+            decision = Decision(str(time.time()), "set_temp", "ac", {"temp": temp}, f"Устанавливаю температуру {temp} градусов")
+
+        elif analysis.intent == "order_drink":
             kettle = self.devices.get_device("kettle")
-            # Проверка ресурсов (Gateway в BPMN)
-            if kettle and kettle.get_water_level() < 0.1:
-                return self._save_decision("error", "User", "нет воды")
+            robot = self.devices.get_device("robot")
             
-            if kettle: kettle.execute_command("boil", {"temp": 95})
-            return self._save_decision("brew_tea", "Kettle", "чайник включен")
-        
-        # Логика климата (Image 8 из ЛР 2)
-        elif intent == "control_climate":
-            ac = self.devices.get_device("ac_living_room")
-            target = params.get("target_temp", 22)
-            if ac: ac.execute_command("set_temp", {"temp": target})
-            return self._save_decision("set_climate", "AC", f"температура установлена на {target} градусов.")
+            # BPMN Logic: Check resources (Source 74)
+            if kettle.water_level < 0.1:
+                return Decision(str(time.time()), "error", "kettle", {}, "В чайнике мало воды")
+            
+            kettle.execute_command("boil", {"temp": 95})
+            # Симуляция ожидания (Source 76)
+            print("   [Process] Ожидание закипания...") 
+            robot.execute_command("deliver", {"destination": "UserLocation"})
+            
+            decision = Decision(str(time.time()), "make_tea", "system", {}, "Ваш чай готовится и скоро будет доставлен")
 
-        return self._save_decision("unknown", "none", "команда не распознана.")
-
-    def _save_decision(self, action, target, message):
-        decision = Decision(id=str(time.time()), action_type=action, target_device=target, parameters={}, message=message)
-        self.decision_repo.save(decision)
+        self.repo.save(decision)
         return decision
 
-class ResponseController:
-    def __init__(self):
-        self.engine = pyttsx3.init()
-        self.engine.setProperty('rate', 150) 
-
-    def execute_feedback(self, decision: Decision):
-        print(f"\n команда отправлена на {decision.target_device} -> {decision.action_type}")
-        print(f"аудио ответ: {decision.message}")
-        try:
-            self.engine.say(decision.message)
-            self.engine.runAndWait()
-        except:
-            pass # Если TTS не инициализирован
-
+# --- Direction 3: Personalization (Source 23) ---
 class PersonalizationController:
-    def __init__(self, repo: PersonalizationRepository):
+    def __init__(self, repo: IRepository):
         self.repo = repo
-        self.current_settings = {}
+    
+    def get_settings(self, user_id: int) -> UserProfile:
+        profiles = self.repo.get_all()
+        return profiles.get(user_id, UserProfile(user_id))
 
-    def load_settings_for_user(self, user_id: int):
-        profile = self.repo.get_profile(user_id)
-        self.current_settings = {"speed": profile.voice_speed, "volume": profile.voice_volume}
-        print(f"профиль пользователя {user_id} применен.")
+class ResponseController:
+    def __init__(self, pers_ctrl: PersonalizationController):
+        self.pers_ctrl = pers_ctrl
+        self.engine = pyttsx3.init() if pyttsx3 else None
 
-    def update_setting(self, key: str, value: any):
-        cmd = PersonalizationCommand(self.current_settings, key, value)
-        cmd.execute()
+    def respond(self, decision: Decision, user: User):
+        # Применение персонализации (Source 55)
+        settings = self.pers_ctrl.get_settings(user.id)
+        
+        print(f"\n[АУДИО ОТВЕТ]: {decision.message}")
+        print(f"   (Настройки голоса: Скорость={settings.voice_speed}, Громкость={settings.voice_volume})")
+
+        if self.engine:
+            try:
+                self.engine.setProperty('rate', settings.voice_speed)
+                self.engine.setProperty('volume', settings.voice_volume)
+                # self.engine.say(decision.message) # Commented out to prevent blocking in non-audio envs
+                # self.engine.runAndWait()
+            except Exception as e:
+                print(f"TTS Error: {e}")
